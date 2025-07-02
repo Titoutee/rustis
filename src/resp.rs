@@ -1,4 +1,4 @@
-use std::io::BufRead;
+use std::{collections::HashMap, sync::{Mutex}};
 
 use anyhow::Result;
 use bytes::{BytesMut};
@@ -13,6 +13,7 @@ use tokio::{
 pub struct RespHandler {
     stream: TcpStream,
     buffer: BytesMut,
+    map: Mutex<HashMap<RedisValue, RedisValue>>, 
 }
 
 impl RespHandler {
@@ -20,6 +21,7 @@ impl RespHandler {
         Self {
             stream,
             buffer: BytesMut::with_capacity(512),
+            map: Mutex::new(HashMap::new()),
         }
     }
 
@@ -36,6 +38,14 @@ impl RespHandler {
 
     pub async fn write_value(&mut self, value: RedisValue) -> Result<usize> {
         Ok(self.stream.write(value.serialize().as_bytes()).await?)
+    }
+
+    pub async fn insert(&mut self, key: RedisValue, value: RedisValue) {
+        self.map.lock().unwrap().insert(key, value); // Previous state and old value are of no use
+    }
+
+    pub async fn get(&mut self, key: RedisValue) -> Option<RedisValue> {
+        self.map.lock().unwrap().get(&key).map(|inner| inner.clone())
     }
 }
 
@@ -112,7 +122,7 @@ fn _parse_int(buffer: &[u8]) -> Result<i64> {
 
 /// RedisValue represents any object passing through a Redis client or server, may it be an integer, a bulk string or
 /// any other main Redis, part of the RESP documentation which can be found [here](https://redis.io/docs/latest/develop/reference/protocol-spec/).
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Clone, Debug, Hash, Eq)]
 pub enum RedisValue {
     SimpleString(String),
     // Error(Bytes),
@@ -122,7 +132,7 @@ pub enum RedisValue {
     #[allow(unused)]
     Int(i64),
     // NullArray,
-    // NullBulkString,
+    NullBulkString,
     // ErrorMsg(Vec<u8>), // This is not a RESP type. This is an redis-oxide internal error type.
 }
 
@@ -131,7 +141,8 @@ impl RedisValue {
     pub fn serialize(self) -> String {
         match self {
             RedisValue::SimpleString(s) => format!("+{}\r\n", s),
-            RedisValue::BulkString(s) => format!("+{}\r\n", s),
+            RedisValue::BulkString(s) => format!("${}\r\n{}\r\n",s.chars().count(), s),
+            RedisValue::NullBulkString => "$-1\r\n".to_string(),
             _ => unimplemented!(), // RedisValue::Array(v) =>
         }
     }

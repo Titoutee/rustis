@@ -15,15 +15,27 @@ async fn handle_connection(stream: TcpStream) {
         let response = if let Some(v) = val {
             // If there is a valid value: read from the buffer
             let (command, args) = extract_cmd(v).unwrap();
-            println!("dsdfs");
-            match command.to_lowercase().as_str() {
+            println!("Received \"{}\" call", command.to_ascii_lowercase());
+            match command.to_ascii_lowercase().as_str() {
                 "ping" => {
-                    println!("Received PING call");
-                    RedisValue::SimpleString("PONGO".to_string())
+                    //println!("Received PING call");
+                    RedisValue::SimpleString(format!("PONG"))
                 }
                 "echo" => {
-                    println!("Received ECHO call");
+                    //println!("Received ECHO call");
                     args.first().unwrap().clone()
+                }
+                "set" => {
+                    handler.insert(args.first().unwrap().clone(), args.iter().nth(1).unwrap().clone()).await;
+                    RedisValue::SimpleString("Ok".to_string())
+                }
+                "get" => {
+
+                    if let Some(a) = handler.get(args.first().unwrap().clone()).await {
+                        a
+                    } else {
+                        RedisValue::NullBulkString
+                    }
                 }
                 c => panic!("Erroneous command to handle: {}", c),
             }
