@@ -1,8 +1,7 @@
+use std::io::BufRead;
+
 use anyhow::Result;
 use bytes::{BytesMut};
-/// RESP bulk string parser and ops
-/// This parsor is largely inspaired by [this implementation](https://www.howtogeek.com/devops/how-to-use-git-with-multiple-remote-repositories/)
-
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -58,12 +57,12 @@ fn parse_simple_string(buffer: BytesMut) -> Result<(RedisValue, usize)> {
         return Ok((RedisValue::SimpleString(string), len + 1));
     }
 
-    Err(anyhow::anyhow!("Not a "))
+    Err(anyhow::anyhow!("Not a valid simple string: {:?}", buffer))
 }
 
 fn parse_bulk_string(buffer: BytesMut) -> Result<(RedisValue, usize)> {
-    let (bulk_str_len, bytes_consumed) = if let Some((_, len)) = read_until_crlf(&buffer[1..]) {
-        let bulk_str_len = _parse_int(&buffer[..])?;
+    let (bulk_str_len, bytes_consumed) = if let Some((line, len)) = read_until_crlf(&buffer[1..]) {
+        let bulk_str_len = _parse_int(line)?;
 
         (bulk_str_len, len + 1)
     } else {
@@ -119,6 +118,8 @@ pub enum RedisValue {
     // Error(Bytes),
     BulkString(String),
     Array(Vec<RedisValue>),
+
+    #[allow(unused)]
     Int(i64),
     // NullArray,
     // NullBulkString,
