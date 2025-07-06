@@ -1,19 +1,49 @@
-use std::{collections::HashMap, sync::{Mutex}};
+use core::{option::Option::{self, None}};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::Result;
-use bytes::{BytesMut};
+use bytes::BytesMut;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    time::{Duration, Instant},
 };
 
 // pub type Bytes = Vec<u8>;
 // type RedisResult = Result<Option<(usize, RedisBufSplit)>, RESPError>;
 
+#[derive(Debug, Clone)]
+pub struct Set {
+    org: Instant,
+    exp: Option<Duration>,
+    val: RedisValue,
+}
+
+impl Set {
+    pub fn new(val: RedisValue, exp: Option<Duration>) -> Self {
+        Self {
+            org: Instant::now(),
+            exp,
+            val,
+        }
+    }
+
+    fn rtime_valid(&self) -> bool {
+        if let Some(e) = self.exp {
+           self.org.elapsed().as_millis() <= e.as_millis()
+        } else {
+            true
+        }
+    }
+}
+
 pub struct RespHandler {
     stream: TcpStream,
     buffer: BytesMut,
-    map: Mutex<HashMap<RedisValue, RedisValue>>, 
+    map: Arc<Mutex<HashMap<RedisValue, Set>>>,
 }
 
 impl RespHandler {
@@ -21,7 +51,7 @@ impl RespHandler {
         Self {
             stream,
             buffer: BytesMut::with_capacity(512),
-            map: Mutex::new(HashMap::new()),
+            map: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -40,12 +70,23 @@ impl RespHandler {
         Ok(self.stream.write(value.serialize().as_bytes()).await?)
     }
 
-    pub async fn insert(&mut self, key: RedisValue, value: RedisValue) {
-        self.map.lock().unwrap().insert(key, value); // Previous state and old value are of no use
+    pub async fn insert(&mut self, key: RedisValue, value: RedisValue, exp: Option<Duration>) {
+        self.map.lock().unwrap().insert(key, Set::new(value, exp)); // Previous state and old value are of no use
     }
 
     pub async fn get(&mut self, key: RedisValue) -> Option<RedisValue> {
-        self.map.lock().unwrap().get(&key).map(|inner| inner.clone())
+        let set = self
+            .map
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|inner| inner.clone())?;
+        if set.rtime_valid() {
+            Some(set.val)
+        } else {
+            self.map.lock().unwrap().remove_entry(&key);
+            None
+        }
     }
 }
 
@@ -54,8 +95,11 @@ fn parse_msg(buffer: BytesMut) -> Result<(RedisValue, usize)> {
         '+' => parse_simple_string(buffer),
         '$' => parse_bulk_string(buffer),
         '*' => parse_array(buffer),
-        ':' => // parse_int(&buffer[1..]),
-        unimplemented!(),
+        ':' =>
+        // parse_int(&buffer[1..]),
+        {
+            unimplemented!()
+        }
         _ => Err(anyhow::anyhow!("Not a valid RESP type: {:?}", buffer)),
     }
 }
@@ -82,17 +126,23 @@ fn parse_bulk_string(buffer: BytesMut) -> Result<(RedisValue, usize)> {
     let end_of_bulk_str = bytes_consumed + bulk_str_len as usize;
     let parsed = end_of_bulk_str + 2;
 
-    Ok((RedisValue::BulkString(String::from_utf8(buffer[bytes_consumed..end_of_bulk_str].to_vec())?), parsed))
+    Ok((
+        RedisValue::BulkString(String::from_utf8(
+            buffer[bytes_consumed..end_of_bulk_str].to_vec(),
+        )?),
+        parsed,
+    ))
 }
 
 fn parse_array(buffer: BytesMut) -> Result<(RedisValue, usize)> {
-    let (array_length, mut bytes_consumed) = if let Some((line, len)) = read_until_crlf(&buffer[1..]) {
-        let array_length = _parse_int(line)?;
+    let (array_length, mut bytes_consumed) =
+        if let Some((line, len)) = read_until_crlf(&buffer[1..]) {
+            let array_length = _parse_int(line)?;
 
-        (array_length, len + 1)
-    } else {
-        return Err(anyhow::anyhow!("Invalid array format {:?}", buffer));
-    };
+            (array_length, len + 1)
+        } else {
+            return Err(anyhow::anyhow!("Invalid array format {:?}", buffer));
+        };
 
     let mut items = vec![];
     for _ in 0..array_length {
@@ -102,7 +152,7 @@ fn parse_array(buffer: BytesMut) -> Result<(RedisValue, usize)> {
         bytes_consumed += len;
     }
 
-    return Ok((RedisValue::Array(items), bytes_consumed))
+    return Ok((RedisValue::Array(items), bytes_consumed));
 }
 
 // (segment, length_of_segment)
@@ -136,14 +186,22 @@ pub enum RedisValue {
     // ErrorMsg(Vec<u8>), // This is not a RESP type. This is an redis-oxide internal error type.
 }
 
-
 impl RedisValue {
     pub fn serialize(self) -> String {
         match self {
             RedisValue::SimpleString(s) => format!("+{}\r\n", s),
-            RedisValue::BulkString(s) => format!("${}\r\n{}\r\n",s.chars().count(), s),
+            RedisValue::BulkString(s) => format!("${}\r\n{}\r\n", s.chars().count(), s),
             RedisValue::NullBulkString => "$-1\r\n".to_string(),
             _ => unimplemented!(), // RedisValue::Array(v) =>
+        }
+    }
+
+    /// Unpacks only variants that hold string types
+    pub fn unpack_str_variant(&self) -> Option<&str> {
+        match self {
+            RedisValue::SimpleString(s) => Some(s),
+            RedisValue::BulkString(s)  => Some(s),
+            _ => None,
         }
     }
 }

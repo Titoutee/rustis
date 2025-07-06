@@ -1,6 +1,7 @@
 mod resp;
 
 use anyhow::Result;
+use core::{option::Option::None, time::Duration};
 use resp::{RedisValue, RespHandler};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -22,15 +23,50 @@ async fn handle_connection(stream: TcpStream) {
                     RedisValue::SimpleString(format!("PONG"))
                 }
                 "echo" => {
-                    //println!("Received ECHO call");
+                    //println!("Received ECHO call");²
                     args.first().unwrap().clone()
                 }
                 "set" => {
-                    handler.insert(args.first().unwrap().clone(), args.iter().nth(1).unwrap().clone()).await;
+                    println!("{:?}", args);
+                    let mut args_iter = args.iter();
+                    // #[warn(soft_unstable)]
+                    let (key, value, sub1, sub2) = (
+                        args_iter.next(),
+                        args_iter.next(),
+                        args_iter.next(),
+                        args_iter.next(),
+                    );
+
+
+                    //println!("{:?}, {:?}, {:?}, {:?}", key.unwrap(), value.unwrap(), sub1.unwrap(), sub2.unwrap());
+
+                    let exp = if let Some(cmd) = sub1 {
+                        // println!("out of PX");
+                        println!("{}", cmd.unpack_str_variant().unwrap());
+                        match cmd.unpack_str_variant().unwrap() {
+                            "PX" => {
+                                println!("in PX");
+                                if let Some(d) = sub2 {
+                                    let milli =
+                                        d.unpack_str_variant().unwrap().parse::<u64>().unwrap();
+
+                                    Some(Duration::from_millis(milli))
+                                } else {
+                                    None
+                                }
+                            }
+
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    handler
+                        .insert(key.unwrap().clone(), value.unwrap().clone(), exp)
+                        .await;
                     RedisValue::SimpleString("Ok".to_string())
                 }
                 "get" => {
-
                     if let Some(a) = handler.get(args.first().unwrap().clone()).await {
                         a
                     } else {
@@ -45,7 +81,8 @@ async fn handle_connection(stream: TcpStream) {
 
         println!("Sending value {:?}", response);
 
-        if let Err(e) = handler.write_value(response).await { // Serialization happens here
+        if let Err(e) = handler.write_value(response).await {
+            // Serialization happens here
             eprintln!("Error writing value: {}", e);
             break; // Stop processing if writing fails
         }
@@ -54,9 +91,7 @@ async fn handle_connection(stream: TcpStream) {
 
 fn extract_cmd(val: RedisValue) -> Result<(String, Vec<RedisValue>)> {
     match val {
-        RedisValue::SimpleString(s) => {
-            Ok((s, vec![]))
-        }
+        RedisValue::SimpleString(s) => Ok((s, vec![])),
         RedisValue::Array(a) => Ok((
             unpack_bulk_str(a.first().unwrap().clone())?,
             a.into_iter().skip(1).collect(),
@@ -86,7 +121,7 @@ async fn main() {
 
         match stream {
             Ok((stream, _)) => {
-                tokio::spawn(async move {handle_connection(stream).await});
+                tokio::spawn(async move { handle_connection(stream).await });
             }
             Err(e) => {
                 println!("Stream error: {}", e);

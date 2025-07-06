@@ -1,5 +1,5 @@
 # Rustis
-Rustis is a compact, babytoy Redis server implementing  part of *standard RESP*, written in pure Rust.
+Rustis is a compact, thread-safe, babytoy Redis server implementing  part of *standard RESP*, written in pure Rust.
 
 ## Motivation
 This project was firstly motivated by the **Codecrafters** related project, and was further developed away from CC's framework, and thus became a personal initiative.
