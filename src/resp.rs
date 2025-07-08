@@ -1,25 +1,25 @@
-use core::{option::Option::{self, None}};
+use crate::RedisValueInner;
+use anyhow::Result;
+use bytes::BytesMut;
+use core::option::Option::{self, None};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
-
-use anyhow::Result;
-use bytes::BytesMut;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     time::{Duration, Instant},
 };
 
-// pub type Bytes = Vec<u8>;
+pub type RedisInt = i64;
 // type RedisResult = Result<Option<(usize, RedisBufSplit)>, RESPError>;
 
 #[derive(Debug, Clone)]
 pub struct Set {
     org: Instant,
-    exp: Option<Duration>,
-    val: RedisValue,
+    pub exp: Option<Duration>,
+    pub val: RedisValue,
 }
 
 impl Set {
@@ -31,9 +31,15 @@ impl Set {
         }
     }
 
-    fn rtime_valid(&self) -> bool {
+    pub fn from_other(other: &Self, value: RedisValue) -> Self {
+        let mut new = other.clone();
+        new.val = value;
+        new
+    }
+
+    pub fn rtime_valid(&self) -> bool {
         if let Some(e) = self.exp {
-           self.org.elapsed().as_millis() <= e.as_millis()
+            self.org.elapsed().as_millis() <= e.as_millis()
         } else {
             true
         }
@@ -43,7 +49,7 @@ impl Set {
 pub struct RespHandler {
     stream: TcpStream,
     buffer: BytesMut,
-    map: Arc<Mutex<HashMap<RedisValue, Set>>>,
+    pub map: Arc<Mutex<HashMap<RedisValue, Set>>>,
 }
 
 impl RespHandler {
@@ -62,6 +68,7 @@ impl RespHandler {
             return Ok(None);
         }
 
+        // Here ignore the length result
         let (v, _) = parse_msg(self.buffer.split())?;
         Ok(Some(v))
     }
@@ -74,13 +81,45 @@ impl RespHandler {
         self.map.lock().unwrap().insert(key, Set::new(value, exp)); // Previous state and old value are of no use
     }
 
-    pub async fn get(&mut self, key: RedisValue) -> Option<RedisValue> {
+    /// Increments the key-corresponding value up to the current value added with `add`.
+    /// As it signatures enforces, matching the `RedisValue::Int` variants apart from the others is done beforehand.
+    pub async fn incr(&mut self, key: &RedisValue, add: RedisInt) -> Option<i64> {
+        let res = self.map.lock().unwrap().get(key)?.val.clone();
+        (*self.map.lock().unwrap().get_mut(key)?) = Set::from_other(
+            self.map.lock().unwrap().get(key)?,
+            RedisValue::Int(
+                (*self.map.lock().unwrap().get(key)?)
+                    .val
+                    .unpack_int_variant()?
+                    + add,
+            ),
+        );
+        return Some(res.unpack_int_variant()?);
+    }
+
+    pub async fn get_set(&self, key: &RedisValue) -> Option<Set> {
         let set = self
             .map
             .lock()
             .unwrap()
             .get(&key)
-            .map(|inner| inner.clone())?;
+            .map(|inner| inner.clone())?; // Clone happens here but could happen in `handle_connection` under "GET"
+        if set.rtime_valid() {
+            Some(set)
+        } else {
+            self.map.lock().unwrap().remove_entry(&key);
+            None
+        }
+    }
+
+    // Returns owned RedisValue (or call `get_set` and access `.val`)
+    pub async fn get_val(&self, key: &RedisValue) -> Option<RedisValue> {
+        let set = self
+            .map
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|inner| inner.clone())?; // Clone happens here but could happen in `handle_connection` under "GET"
         if set.rtime_valid() {
             Some(set.val)
         } else {
@@ -95,11 +134,7 @@ fn parse_msg(buffer: BytesMut) -> Result<(RedisValue, usize)> {
         '+' => parse_simple_string(buffer),
         '$' => parse_bulk_string(buffer),
         '*' => parse_array(buffer),
-        ':' =>
-        // parse_int(&buffer[1..]),
-        {
-            unimplemented!()
-        }
+        ':' => parse_int(buffer),
         _ => Err(anyhow::anyhow!("Not a valid RESP type: {:?}", buffer)),
     }
 }
@@ -107,7 +142,6 @@ fn parse_msg(buffer: BytesMut) -> Result<(RedisValue, usize)> {
 fn parse_simple_string(buffer: BytesMut) -> Result<(RedisValue, usize)> {
     if let Some((line, len)) = read_until_crlf(&buffer[1..]) {
         let string = String::from_utf8(line.to_vec()).unwrap();
-
         return Ok((RedisValue::SimpleString(string), len + 1));
     }
 
@@ -155,6 +189,17 @@ fn parse_array(buffer: BytesMut) -> Result<(RedisValue, usize)> {
     return Ok((RedisValue::Array(items), bytes_consumed));
 }
 
+// /!\ Call with buffer[..], not buffer[1..]
+
+pub fn parse_int(buffer: BytesMut) -> Result<(RedisValue, usize)> {
+    let parsed = _parse_int(&buffer[1..])?;
+    Ok((RedisValue::Int(parsed), 0))
+}
+
+fn _parse_int(buffer: &[u8]) -> Result<RedisInt> {
+    Ok(String::from_utf8(buffer.to_vec())?.trim().parse::<RedisInt>()?)
+}
+
 // (segment, length_of_segment)
 fn read_until_crlf(buffer: &[u8]) -> Option<(&[u8], usize)> {
     for i in 1..buffer.len() {
@@ -164,10 +209,6 @@ fn read_until_crlf(buffer: &[u8]) -> Option<(&[u8], usize)> {
     }
 
     return None;
-}
-
-fn _parse_int(buffer: &[u8]) -> Result<i64> {
-    Ok(String::from_utf8(buffer.to_vec())?.parse::<i64>()?)
 }
 
 /// RedisValue represents any object passing through a Redis client or server, may it be an integer, a bulk string or
@@ -180,7 +221,7 @@ pub enum RedisValue {
     Array(Vec<RedisValue>),
 
     #[allow(unused)]
-    Int(i64),
+    Int(RedisInt),
     // NullArray,
     NullBulkString,
     // ErrorMsg(Vec<u8>), // This is not a RESP type. This is an redis-oxide internal error type.
@@ -191,6 +232,7 @@ impl RedisValue {
         match self {
             RedisValue::SimpleString(s) => format!("+{}\r\n", s),
             RedisValue::BulkString(s) => format!("${}\r\n{}\r\n", s.chars().count(), s),
+            RedisValue::Int(n) => format!(":{}", n),
             RedisValue::NullBulkString => "$-1\r\n".to_string(),
             _ => unimplemented!(), // RedisValue::Array(v) =>
         }
@@ -200,8 +242,25 @@ impl RedisValue {
     pub fn unpack_str_variant(&self) -> Option<&str> {
         match self {
             RedisValue::SimpleString(s) => Some(s),
-            RedisValue::BulkString(s)  => Some(s),
+            RedisValue::BulkString(s) => Some(s),
             _ => None,
+        }
+    }
+
+    /// Unpacks only variants that hold int types
+    pub fn unpack_int_variant(&self) -> Option<RedisInt> {
+        match self {
+            RedisValue::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    pub fn unpack(&self) -> Option<&dyn RedisValueInner> {
+        match self {
+            RedisValue::SimpleString(s) => Some(s),
+            RedisValue::BulkString(s) => Some(s),
+            RedisValue::Int(n) => Some(n),
+            _ => unimplemented!(),
         }
     }
 }

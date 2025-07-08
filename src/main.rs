@@ -1,7 +1,10 @@
+mod ext;
 mod resp;
 
 use anyhow::Result;
 use core::{option::Option::None, time::Duration};
+pub use ext::RedisValueInner;
+pub use resp::RedisInt;
 use resp::{RedisValue, RespHandler};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -37,19 +40,20 @@ async fn handle_connection(stream: TcpStream) {
                         args_iter.next(),
                     );
 
-
-                    //println!("{:?}, {:?}, {:?}, {:?}", key.unwrap(), value.unwrap(), sub1.unwrap(), sub2.unwrap());
-
                     let exp = if let Some(cmd) = sub1 {
                         // println!("out of PX");
                         println!("{}", cmd.unpack_str_variant().unwrap());
-                        match cmd.unpack_str_variant().unwrap() {
-                            "PX" => {
-                                println!("in PX");
+                        match cmd
+                            .unpack_str_variant()
+                            .unwrap()
+                            .to_ascii_lowercase()
+                            .as_str()
+                        {
+                            "px" => {
+                                // println!("in PX");
                                 if let Some(d) = sub2 {
                                     let milli =
                                         d.unpack_str_variant().unwrap().parse::<u64>().unwrap();
-
                                     Some(Duration::from_millis(milli))
                                 } else {
                                     None
@@ -64,14 +68,28 @@ async fn handle_connection(stream: TcpStream) {
                     handler
                         .insert(key.unwrap().clone(), value.unwrap().clone(), exp)
                         .await;
-                    RedisValue::SimpleString("Ok".to_string())
+                    RedisValue::SimpleString("Ok".to_string()) // Answer for SET calls is "Ok".
                 }
                 "get" => {
-                    if let Some(a) = handler.get(args.first().unwrap().clone()).await {
+                    if let Some(a) = handler.get_val(args.first().unwrap()).await {
                         a
                     } else {
                         RedisValue::NullBulkString
                     }
+                }
+                "incr" => {
+                    let key = args.iter().next().unwrap().clone();
+                    let val = handler.get_val(&key).await;
+                    let set = handler.get_set(&key).await.unwrap();
+                    let response = match val {
+                        None => RedisValue::NullBulkString,
+                        Some(RedisValue::Int(n)) => {
+                            handler.insert(key, RedisValue::Int(n+1), set.exp).await;
+                            RedisValue::Int(n)
+                        }
+                        _ => RedisValue::NullBulkString,
+                    };
+                    response
                 }
                 c => panic!("Erroneous command to handle: {}", c),
             }
