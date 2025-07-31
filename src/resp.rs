@@ -3,8 +3,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use core::option::Option::{self, None};
 use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
+    collections::HashMap, fmt::format, sync::{Arc, Mutex}
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -13,6 +12,7 @@ use tokio::{
 };
 
 pub type RedisInt = i64;
+pub type RedisArray = Vec<RedisInt>;
 // type RedisResult = Result<Option<(usize, RedisBufSplit)>, RESPError>;
 
 #[derive(Debug, Clone)]
@@ -83,18 +83,26 @@ impl RespHandler {
 
     /// Increments the key-corresponding value up to the current value added with `add`.
     /// As it signatures enforces, matching the `RedisValue::Int` variants apart from the others is done beforehand.
-    pub async fn incr(&mut self, key: &RedisValue, add: RedisInt) -> Option<i64> {
-        let res = self.map.lock().unwrap().get(key)?.val.clone();
-        (*self.map.lock().unwrap().get_mut(key)?) = Set::from_other(
-            self.map.lock().unwrap().get(key)?,
-            RedisValue::Int(
-                (*self.map.lock().unwrap().get(key)?)
-                    .val
+    ///
+    /// If the Set is not key-present when incrementing, it is inserted with a default value of 1.
+    pub async fn incr(&mut self, key: &RedisValue /* Should be RedisValue::Int() */) -> Option<RedisValue> {
+        // let res = self.map.lock().unwrap().get(key)?.val.clone();
+        let (res, new_set) = if let Some (r) = self.map.lock().unwrap().get_mut(key) {
+            let val = RedisValue::Int(
+                r.val
                     .unpack_int_variant()?
-                    + add,
-            ),
-        );
-        return Some(res.unpack_int_variant()?);
+                    + 1,
+            );
+            (RedisValue::Int(
+                r.val
+                    .unpack_int_variant()?
+            ), Set::from_other(r, val))
+        } else {
+            (RedisValue::Int(0), Set::new(RedisValue::Int(1), None)) // If key is not present, default is val 1 and no expiry (as one cannot conceptually be decided)
+            // and preceding value is 0.
+        };
+        self.map.lock().ok()?.insert(key.clone(), new_set);
+        Some(res)
     }
 
     pub async fn get_set(&self, key: &RedisValue) -> Option<Set> {
@@ -224,7 +232,7 @@ pub enum RedisValue {
     Int(RedisInt),
     // NullArray,
     NullBulkString,
-    // ErrorMsg(Vec<u8>), // This is not a RESP type. This is an redis-oxide internal error type.
+    ErrorMsg(Vec<u8>), // This is not a RESP type.
 }
 
 impl RedisValue {
@@ -234,7 +242,11 @@ impl RedisValue {
             RedisValue::BulkString(s) => format!("${}\r\n{}\r\n", s.chars().count(), s),
             RedisValue::Int(n) => format!(":{}", n),
             RedisValue::NullBulkString => "$-1\r\n".to_string(),
-            _ => unimplemented!(), // RedisValue::Array(v) =>
+            RedisValue::Array(v) => { // Heavy many clones
+                format!("*{}\r\n{}", v.len(), v.iter().map(|rv| rv.clone().serialize()).collect::<String>())
+            }
+            RedisValue::ErrorMsg(v) => format!("-{}\r\n{}", v.len(), String::from_utf8(v).unwrap())
+            // v is correctly created at source => safer implementation could be wanted though
         }
     }
 

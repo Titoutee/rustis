@@ -1,11 +1,6 @@
-mod ext;
-mod resp;
-
 use anyhow::Result;
 use core::{option::Option::None, time::Duration};
-pub use ext::RedisValueInner;
-pub use resp::RedisInt;
-use resp::{RedisValue, RespHandler};
+use rustis::{RespHandler, RedisValue};
 use tokio::net::{TcpListener, TcpStream};
 
 async fn handle_connection(stream: TcpStream) {
@@ -17,9 +12,10 @@ async fn handle_connection(stream: TcpStream) {
         });
 
         let response = if let Some(v) = val {
+            // println!("Received<<<<< {:?}", v.clone().serialize()); // Pretty print full value
             // If there is a valid value: read from the buffer
             let (command, args) = extract_cmd(v).unwrap();
-            println!("Received \"{}\" call", command.to_ascii_lowercase());
+            // println!("Received \"{}\" call", command.to_ascii_lowercase());
             match command.to_ascii_lowercase().as_str() {
                 "ping" => {
                     //println!("Received PING call");
@@ -78,16 +74,18 @@ async fn handle_connection(stream: TcpStream) {
                     }
                 }
                 "incr" => {
-                    let key = args.iter().next().unwrap().clone();
+                    let key = &args.iter().next().unwrap().clone();
                     let val = handler.get_val(&key).await;
-                    let set = handler.get_set(&key).await.unwrap();
+                    
                     let response = match val {
-                        None => RedisValue::NullBulkString,
-                        Some(RedisValue::Int(n)) => {
-                            handler.insert(key, RedisValue::Int(n+1), set.exp).await;
-                            RedisValue::Int(n)
+                        Some(RedisValue::Int(_)) | None => {
+                            if let Some(n) = handler.incr(key).await {
+                                n 
+                            } else {
+                                RedisValue::NullBulkString
+                            }
                         }
-                        _ => RedisValue::NullBulkString,
+                        _ => RedisValue::ErrorMsg(Vec::from("(error) value is not an integer or out of range")),
                     };
                     response
                 }
@@ -97,7 +95,7 @@ async fn handle_connection(stream: TcpStream) {
             break;
         };
 
-        println!("Sending value {:?}", response);
+        println!("(Sent)   >>>>>   {:?}", response);
 
         if let Err(e) = handler.write_value(response).await {
             // Serialization happens here
