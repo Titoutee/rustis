@@ -1,10 +1,14 @@
 use anyhow::Result;
 use core::{option::Option::None, time::Duration};
-use rustis::{RespHandler, RedisValue};
+use std::{clone, collections::HashMap, sync::{Arc, Mutex}};
+use rustis::{Database, RedisValue, RespHandler, ThreadSafeDb, ShuffleCtr};
 use tokio::net::{TcpListener, TcpStream};
 
-async fn handle_connection(stream: TcpStream) {
-    let mut handler = RespHandler::new(stream);
+const DB_SZ: usize = 4_096;
+const IDS: usize = 100;
+
+async fn handle_connection(stream: TcpStream, id: usize, map: ThreadSafeDb) {
+    let mut handler = RespHandler::new(stream, id, map);
     loop {
         let val = handler.read_value().await.unwrap_or_else(|e| {
             eprintln!("Error reading value: {}", e);
@@ -89,6 +93,7 @@ async fn handle_connection(stream: TcpStream) {
                     };
                     response
                 }
+
                 c => panic!("Erroneous command to handle: {}", c),
             }
         } else {
@@ -132,12 +137,18 @@ fn unpack_bulk_str(val: RedisValue) -> Result<String> {
 #[tokio::main]
 async fn main() {
     let listener = TcpListener::bind("127.0.0.1:6378").await.unwrap();
+    let map = Arc::new(Mutex::new(HashMap::with_capacity(DB_SZ)));
+    let mut client_id = ShuffleCtr::init(IDS);
+
     loop {
         let stream = listener.accept().await;
 
         match stream {
             Ok((stream, _)) => {
-                tokio::spawn(async move { handle_connection(stream).await });
+                let cloned = Arc::clone(&map);
+                let id = client_id.get_new_id();
+                tokio::spawn(async move { handle_connection(stream, id, cloned).await });
+                client_id.release(id);
             }
             Err(e) => {
                 println!("Stream error: {}", e);

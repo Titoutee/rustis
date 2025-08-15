@@ -3,7 +3,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use core::option::Option::{self, None};
 use std::{
-    collections::HashMap, fmt::format, sync::{Arc, Mutex}
+    collections::HashMap, sync::{Arc, Mutex}
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -11,9 +11,13 @@ use tokio::{
     time::{Duration, Instant},
 };
 
+// type RedisResult = Result<Option<(usize, RedisBufSplit)>, RESPError>;
+
 pub type RedisInt = i64;
 pub type RedisArray = Vec<RedisInt>;
-// type RedisResult = Result<Option<(usize, RedisBufSplit)>, RESPError>;
+pub type Database = HashMap<RedisValue, Set>;
+type LockedDb = Mutex<Database>;
+pub type ThreadSafeDb = Arc<LockedDb>;
 
 #[derive(Debug, Clone)]
 pub struct Set {
@@ -47,17 +51,20 @@ impl Set {
 }
 
 pub struct RespHandler {
+    client_id: usize,
     stream: TcpStream,
     buffer: BytesMut,
-    pub map: Arc<Mutex<HashMap<RedisValue, Set>>>,
+    pub map: ThreadSafeDb, // *Database*
+
 }
 
 impl RespHandler {
-    pub fn new(stream: TcpStream) -> Self {
+    pub fn new(stream: TcpStream, id: usize, map: ThreadSafeDb) -> Self {
         Self {
+            client_id: id,
             stream,
             buffer: BytesMut::with_capacity(512),
-            map: Arc::new(Mutex::new(HashMap::new())),
+            map: map,
         }
     }
 
