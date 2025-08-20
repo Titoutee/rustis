@@ -100,11 +100,6 @@ try:
     data = tcp_socket.recv(512)
     print(data)
 
-    data = str.encode("*2\r\n$4\r\nINCR\r\n$3\r\nlol\r\n")
-    tcp_socket.sendall(data)
-    data = tcp_socket.recv(512)
-    print(data)
-
 finally:
     print("Closing socket")
     tcp_socket.close()

@@ -3,7 +3,9 @@ use anyhow::Result;
 use bytes::BytesMut;
 use core::option::Option::{self, None};
 use std::{
-    collections::HashMap, sync::{Arc, Mutex}
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+    vec,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -15,9 +17,10 @@ use tokio::{
 
 pub type RedisInt = i64;
 pub type RedisArray = Vec<RedisInt>;
-pub type Database = HashMap<RedisValue, Set>;
+pub type Database = HashMap<String, Set>;
 type LockedDb = Mutex<Database>;
 pub type ThreadSafeDb = Arc<LockedDb>;
+pub type Keys = HashSet<String>;
 
 #[derive(Debug, Clone)]
 pub struct Set {
@@ -50,22 +53,33 @@ impl Set {
     }
 }
 
+#[allow(dead_code)]
 pub struct RespHandler {
     client_id: usize,
     stream: TcpStream,
     buffer: BytesMut,
     pub map: ThreadSafeDb, // *Database*
-
+    self_keys: Keys,       // Server-side for safety reasons
 }
 
-impl RespHandler {
+/// Standalone remove_entry procedure
+pub fn _remove_entry_stdln(db: &mut ThreadSafeDb, key: &str) {
+    db.lock().expect("unlock failed!").remove_entry(key);
+}
+
+impl<'a> RespHandler {
     pub fn new(stream: TcpStream, id: usize, map: ThreadSafeDb) -> Self {
         Self {
             client_id: id,
             stream,
             buffer: BytesMut::with_capacity(512),
             map: map,
+            self_keys: HashSet::new(),
         }
+    }
+
+    fn keyize(&self, key: &RedisValue) -> String {
+        format!("{}{}", key.keyize(), self.client_id)
     }
 
     pub async fn read_value(&mut self) -> Result<Option<RedisValue>> {
@@ -84,35 +98,65 @@ impl RespHandler {
         Ok(self.stream.write(value.serialize().as_bytes()).await?)
     }
 
-    pub async fn insert(&mut self, key: RedisValue, value: RedisValue, exp: Option<Duration>) {
-        self.map.lock().unwrap().insert(key, Set::new(value, exp)); // Previous state and old value are of no use
+    pub async fn insert(&mut self, redval: &RedisValue, value: RedisValue, exp: Option<Duration>) {
+        let key = self.keyize(redval);
+        self.add_entry(key, value, exp);
+    }
+
+    pub fn remove_entry(&mut self, key: &String) {
+        // Remove both from the database and the client handle's inner keys memory
+        self.map.lock().unwrap().remove(key);
+        self.self_keys.remove(key);
+    }
+
+    pub fn add_entry(&mut self, key: String, value: RedisValue, exp: Option<Duration>) {
+        self.map
+            .lock()
+            .expect("unlock failed!")
+            .insert(key.clone(), Set::new(value, exp));
+        self.self_keys.insert(key);
+    }
+
+    pub fn cleanup(&mut self) {
+        let old_map_len = self.map.lock().expect("unlock failed!").len();
+        println!("Cleanup performs on client (id)[{}]", self.client_id);
+        self.self_keys
+            .iter()
+            .for_each(|s| _remove_entry_stdln(&mut self.map, s));
+        println!(
+            "map length went from {} to {} entries",
+            old_map_len,
+            self.map.lock().expect("unlock failed!").len()
+        );
     }
 
     /// Increments the key-corresponding value up to the current value added with `add`.
     /// As it signatures enforces, matching the `RedisValue::Int` variants apart from the others is done beforehand.
     ///
     /// If the Set is not key-present when incrementing, it is inserted with a default value of 1.
-    pub async fn incr(&mut self, key: &RedisValue /* Should be RedisValue::Int() */) -> Option<RedisValue> {
+    pub async fn incr(
+        &mut self,
+        key: &RedisValue, /* Should be RedisValue::Int() */
+    ) -> Option<RedisValue> {
+        // let key = self.keyize(key);
         // let res = self.map.lock().unwrap().get(key)?.val.clone();
-        let (res, new_set) = if let Some (r) = self.map.lock().unwrap().get_mut(key) {
-            let val = RedisValue::Int(
-                r.val
-                    .unpack_int_variant()?
-                    + 1,
-            );
-            (RedisValue::Int(
-                r.val
-                    .unpack_int_variant()?
-            ), Set::from_other(r, val))
+        let (res, new_set) = if let Some(r) = self.map.lock().unwrap().get_mut(&key.keyize()) {
+            let val = RedisValue::Int(r.val.unpack_int_variant()? + 1);
+            (
+                RedisValue::Int(r.val.unpack_int_variant()?),
+                Set::from_other(r, val),
+            )
         } else {
             (RedisValue::Int(0), Set::new(RedisValue::Int(1), None)) // If key is not present, default is val 1 and no expiry (as one cannot conceptually be decided)
             // and preceding value is 0.
         };
-        self.map.lock().ok()?.insert(key.clone(), new_set);
+
+        self.insert(key, new_set.val, new_set.exp).await;
         Some(res)
     }
 
-    pub async fn get_set(&self, key: &RedisValue) -> Option<Set> {
+    pub async fn get_set(&mut self, key: &RedisValue) -> Option<Set> {
+        let key = self.keyize(key);
         let set = self
             .map
             .lock()
@@ -122,13 +166,14 @@ impl RespHandler {
         if set.rtime_valid() {
             Some(set)
         } else {
-            self.map.lock().unwrap().remove_entry(&key);
+            self.remove_entry(&key);
             None
         }
     }
 
-    // Returns owned RedisValue (or call `get_set` and access `.val`)
-    pub async fn get_val(&self, key: &RedisValue) -> Option<RedisValue> {
+    // Returns owned RedisValue instead (or call `get_set` and access `.val`)
+    pub async fn get_val(&mut self, key: &RedisValue) -> Option<RedisValue> {
+        let key = self.keyize(key);
         let set = self
             .map
             .lock()
@@ -138,7 +183,7 @@ impl RespHandler {
         if set.rtime_valid() {
             Some(set.val)
         } else {
-            self.map.lock().unwrap().remove_entry(&key);
+            self.remove_entry(&key);
             None
         }
     }
@@ -150,7 +195,7 @@ fn parse_msg(buffer: BytesMut) -> Result<(RedisValue, usize)> {
         '$' => parse_bulk_string(buffer),
         '*' => parse_array(buffer),
         ':' => parse_int(buffer),
-        _ => Err(anyhow::anyhow!("Not a valid RESP type: {:?}", buffer)),
+        _ => Err(anyhow::anyhow!("Not a valid RESP type: {:?}, starting with prefix: {}", buffer, buffer[0])),
     }
 }
 
@@ -212,7 +257,9 @@ pub fn parse_int(buffer: BytesMut) -> Result<(RedisValue, usize)> {
 }
 
 fn _parse_int(buffer: &[u8]) -> Result<RedisInt> {
-    Ok(String::from_utf8(buffer.to_vec())?.trim().parse::<RedisInt>()?)
+    Ok(String::from_utf8(buffer.to_vec())?
+        .trim()
+        .parse::<RedisInt>()?)
 }
 
 // (segment, length_of_segment)
@@ -239,7 +286,7 @@ pub enum RedisValue {
     Int(RedisInt),
     // NullArray,
     NullBulkString,
-    ErrorMsg(Vec<u8>), // This is not a RESP type.
+    ErrorMsg(Vec<u8>),
 }
 
 impl RedisValue {
@@ -249,12 +296,22 @@ impl RedisValue {
             RedisValue::BulkString(s) => format!("${}\r\n{}\r\n", s.chars().count(), s),
             RedisValue::Int(n) => format!(":{}", n),
             RedisValue::NullBulkString => "$-1\r\n".to_string(),
-            RedisValue::Array(v) => { // Heavy many clones
-                format!("*{}\r\n{}", v.len(), v.iter().map(|rv| rv.clone().serialize()).collect::<String>())
+            RedisValue::Array(v) => {
+                // Heavy many clones
+                format!(
+                    "*{}\r\n{}",
+                    v.len(),
+                    v.iter()
+                        .map(|rv| rv.clone().serialize()) // /!\
+                        .collect::<String>()
+                )
             }
-            RedisValue::ErrorMsg(v) => format!("-{}\r\n{}", v.len(), String::from_utf8(v).unwrap())
-            // v is correctly created at source => safer implementation could be wanted though
+            RedisValue::ErrorMsg(v) => format!("-{}\r\n{}\r\n", v.len(), String::from_utf8(v).unwrap()), // v is correctly created at source => safer implementation could be wanted though
         }
+    }
+
+    pub fn keyize(&self) -> String {
+        self.unpack_for_str().to_string()
     }
 
     /// Unpacks only variants that hold string types
@@ -280,6 +337,17 @@ impl RedisValue {
             RedisValue::BulkString(s) => Some(s),
             RedisValue::Int(n) => Some(n),
             _ => unimplemented!(),
+        }
+    }
+
+    pub fn unpack_for_str(&self) -> &dyn ToString {
+        match self {
+            RedisValue::SimpleString(s) => s,
+            RedisValue::BulkString(s) => s,
+            RedisValue::Int(n) => n,
+            _ => panic!(
+                "String key cannot be constructed from any other value than RedisValue::SimpleString/BulkString/Int"
+            ),
         }
     }
 }

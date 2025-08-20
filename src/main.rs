@@ -1,154 +1,27 @@
-use anyhow::Result;
-use core::{option::Option::None, time::Duration};
-use std::{clone, collections::HashMap, sync::{Arc, Mutex}};
-use rustis::{Database, RedisValue, RespHandler, ThreadSafeDb, ShuffleCtr};
-use tokio::net::{TcpListener, TcpStream};
+use std::{collections::HashMap, sync::{Arc, Mutex}};
+use rustis::{StackCtr, handle_connection};
+use tokio::net::{TcpListener};
 
 const DB_SZ: usize = 4_096;
 const IDS: usize = 100;
-
-async fn handle_connection(stream: TcpStream, id: usize, map: ThreadSafeDb) {
-    let mut handler = RespHandler::new(stream, id, map);
-    loop {
-        let val = handler.read_value().await.unwrap_or_else(|e| {
-            eprintln!("Error reading value: {}", e);
-            return None; // Gracefully return None to break out of the loop
-        });
-
-        let response = if let Some(v) = val {
-            // println!("Received<<<<< {:?}", v.clone().serialize()); // Pretty print full value
-            // If there is a valid value: read from the buffer
-            let (command, args) = extract_cmd(v).unwrap();
-            // println!("Received \"{}\" call", command.to_ascii_lowercase());
-            match command.to_ascii_lowercase().as_str() {
-                "ping" => {
-                    //println!("Received PING call");
-                    RedisValue::SimpleString(format!("PONG"))
-                }
-                "echo" => {
-                    //println!("Received ECHO call");²
-                    args.first().unwrap().clone()
-                }
-                "set" => {
-                    println!("{:?}", args);
-                    let mut args_iter = args.iter();
-                    // #[warn(soft_unstable)]
-                    let (key, value, sub1, sub2) = (
-                        args_iter.next(),
-                        args_iter.next(),
-                        args_iter.next(),
-                        args_iter.next(),
-                    );
-
-                    let exp = if let Some(cmd) = sub1 {
-                        // println!("out of PX");
-                        println!("{}", cmd.unpack_str_variant().unwrap());
-                        match cmd
-                            .unpack_str_variant()
-                            .unwrap()
-                            .to_ascii_lowercase()
-                            .as_str()
-                        {
-                            "px" => {
-                                // println!("in PX");
-                                if let Some(d) = sub2 {
-                                    let milli =
-                                        d.unpack_str_variant().unwrap().parse::<u64>().unwrap();
-                                    Some(Duration::from_millis(milli))
-                                } else {
-                                    None
-                                }
-                            }
-
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
-                    handler
-                        .insert(key.unwrap().clone(), value.unwrap().clone(), exp)
-                        .await;
-                    RedisValue::SimpleString("Ok".to_string()) // Answer for SET calls is "Ok".
-                }
-                "get" => {
-                    if let Some(a) = handler.get_val(args.first().unwrap()).await {
-                        a
-                    } else {
-                        RedisValue::NullBulkString
-                    }
-                }
-                "incr" => {
-                    let key = &args.iter().next().unwrap().clone();
-                    let val = handler.get_val(&key).await;
-                    
-                    let response = match val {
-                        Some(RedisValue::Int(_)) | None => {
-                            if let Some(n) = handler.incr(key).await {
-                                n 
-                            } else {
-                                RedisValue::NullBulkString
-                            }
-                        }
-                        _ => RedisValue::ErrorMsg(Vec::from("(error) value is not an integer or out of range")),
-                    };
-                    response
-                }
-
-                c => panic!("Erroneous command to handle: {}", c),
-            }
-        } else {
-            break;
-        };
-
-        println!("(Sent)   >>>>>   {:?}", response);
-
-        if let Err(e) = handler.write_value(response).await {
-            // Serialization happens here
-            eprintln!("Error writing value: {}", e);
-            break; // Stop processing if writing fails
-        }
-    }
-}
-
-fn extract_cmd(val: RedisValue) -> Result<(String, Vec<RedisValue>)> {
-    match val {
-        RedisValue::SimpleString(s) => Ok((s, vec![])),
-        RedisValue::Array(a) => Ok((
-            unpack_bulk_str(a.first().unwrap().clone())?,
-            a.into_iter().skip(1).collect(),
-        )),
-        _ => Err(anyhow::anyhow!(
-            "Command is not formed properly (not an array of Redis values?)(V): {:?}",
-            val
-        )),
-    }
-}
-
-fn unpack_bulk_str(val: RedisValue) -> Result<String> {
-    match val {
-        RedisValue::BulkString(s) => Ok(s),
-        _ => Err(anyhow::anyhow!(
-            "Unpacking invalid bulk string(V): {:?}",
-            val
-        )),
-    }
-}
 
 #[tokio::main]
 async fn main() {
     let listener = TcpListener::bind("127.0.0.1:6378").await.unwrap();
     let map = Arc::new(Mutex::new(HashMap::with_capacity(DB_SZ)));
-    let mut client_id = ShuffleCtr::init(IDS);
+    let mut _client_id = StackCtr::init(IDS);
+    let client_id = Arc::new(Mutex::new(_client_id));
 
     loop {
         let stream = listener.accept().await;
 
         match stream {
             Ok((stream, _)) => {
-                let cloned = Arc::clone(&map);
-                let id = client_id.get_new_id();
-                tokio::spawn(async move { handle_connection(stream, id, cloned).await });
-                client_id.release(id);
+                let cloned_db = Arc::clone(&map);
+                let cloned_id = Arc::clone(&client_id);
+                let id = client_id.lock().expect("unlock failed!").get_new_id();
+                
+                tokio::spawn(async move { handle_connection(stream, id, cloned_db, cloned_id).await });
             }
             Err(e) => {
                 println!("Stream error: {}", e);
