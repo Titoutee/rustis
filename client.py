@@ -41,7 +41,7 @@ try:
     time.sleep(1)
     print("end of sleep")
 
-    data = str.encode("*2\r\n$3\r\nGET\r\n$3\r\nlol\r\n")
+    data = str.encode("*3\r\nsdfqslkdfh^lksdf\r\n")
     tcp_socket.sendall(data)
     data = tcp_socket.recv(512)
     print(data)
@@ -76,6 +76,11 @@ try:
     print(data)
 
     data = str.encode("*2\r\n$4\r\nINCR\r\n$3\r\nlol\r\n")
+    tcp_socket.sendall(data)
+    data = tcp_socket.recv(512)
+    print(data)
+
+    data = str.encode("*1\r\n$5\r\nMULTI\r\n")
     tcp_socket.sendall(data)
     data = tcp_socket.recv(512)
     print(data)

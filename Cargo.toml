@@ -11,3 +11,6 @@ futures = "0.3.31"
 memchr = "2.7.5"
 thiserror = "2.0.11"                                # error handling
 tokio = { version = "1.23.0", features = ["full"] } # async networking
+
+[features]
+futures03 = []

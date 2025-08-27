@@ -37,6 +37,10 @@ pub enum Notify {
     SendRaw, // For smthg...
 }
 
+pub trait RediSer {
+    fn serialize(&self) -> String; // 
+}
+
 pub trait RedisValueInner {}
 
 impl RedisValueInner for RedisInt {}

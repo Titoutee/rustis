@@ -1,4 +1,7 @@
 use crate::RedisValueInner;
+use crate::RediSer;
+use crate::Transaction;
+use crate::{EMPTY_ARR, OK};
 use anyhow::Result;
 use bytes::BytesMut;
 use core::option::Option::{self, None};
@@ -12,8 +15,6 @@ use tokio::{
     net::TcpStream,
     time::{Duration, Instant},
 };
-
-// type RedisResult = Result<Option<(usize, RedisBufSplit)>, RESPError>;
 
 pub type RedisInt = i64;
 pub type RedisArray = Vec<RedisInt>;
@@ -78,6 +79,91 @@ impl<'a> RespHandler {
         }
     }
 
+    pub(crate) async fn handle_multi(&mut self, transaction: &mut Transaction) -> RedisValue {
+        transaction.switch_trans();
+        RedisValue::SimpleString(OK.to_string())
+    }
+
+    pub(crate) async fn handle_exec(&mut self, transaction: &mut Transaction) -> RedisValue {
+        if !transaction.in_transaction {
+            RedisValue::ErrorMsg(Vec::from("Exec called with empty queue..."));
+        } else if transaction.queue.is_empty() {
+            transaction.switch_neutral();
+            RedisValue::ErrorMsg(Vec::from(EMPTY_ARR));
+        }
+
+        transaction.switch_exec();
+        RedisValue::Command(RedisCommand::EXEC)
+    }
+
+    pub async fn handle_command(&mut self, command: &str, args: Vec<RedisValue>) -> RedisValue {
+        match command {
+            "ping" => RedisValue::SimpleString("PONG".to_string()),
+            "echo" => args.first().unwrap().clone(),
+            "set" => {
+                println!("{:?}", args);
+                let mut args_iter = args.iter();
+                let (key, value, sub1, sub2) = (
+                    args_iter.next(),
+                    args_iter.next(),
+                    args_iter.next(),
+                    args_iter.next(),
+                );
+
+                let exp = if let Some(cmd) = sub1 {
+                    match cmd
+                        .unpack_str_variant()
+                        .unwrap()
+                        .to_ascii_lowercase()
+                        .as_str()
+                    {
+                        "px" => {
+                            if let Some(d) = sub2 {
+                                let milli = d.unpack_str_variant().unwrap().parse::<u64>().unwrap();
+                                Some(Duration::from_millis(milli))
+                            } else {
+                                None
+                            }
+                        }
+
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                self.insert(key.unwrap(), value.unwrap().clone(), exp).await;
+                RedisValue::SimpleString(OK.to_string())
+            }
+            "get" => {
+                if let Some(a) = self.get_val(args.first().unwrap()).await {
+                    a
+                } else {
+                    RedisValue::NullBulkString
+                }
+            }
+            "incr" => {
+                let key = &args.iter().next().unwrap().clone();
+                let val = self.get_val(&key).await;
+
+                let response = match val {
+                    Some(RedisValue::Int(_)) | None => {
+                        if let Some(n) = self.incr(key).await {
+                            n
+                        } else {
+                            RedisValue::NullBulkString
+                        }
+                    }
+                    _ => RedisValue::ErrorMsg(Vec::from(
+                        "(error) value is not an integer or out of range",
+                    )),
+                };
+                response
+            }
+
+            c => panic!("Erroneous command to handle: {}", c),
+        }
+    }
+
     fn keyize(&self, key: &RedisValue) -> String {
         format!("{}{}", key.keyize(), self.client_id)
     }
@@ -94,7 +180,7 @@ impl<'a> RespHandler {
         Ok(Some(v))
     }
 
-    pub async fn write_value(&mut self, value: RedisValue) -> Result<usize> {
+    pub async fn write_value<T: RediSer>(&mut self, value: T) -> Result<usize> {
         Ok(self.stream.write(value.serialize().as_bytes()).await?)
     }
 
@@ -195,7 +281,12 @@ fn parse_msg(buffer: BytesMut) -> Result<(RedisValue, usize)> {
         '$' => parse_bulk_string(buffer),
         '*' => parse_array(buffer),
         ':' => parse_int(buffer),
-        _ => Err(anyhow::anyhow!("Not a valid RESP type: {:?}, starting with prefix: {}", buffer, buffer[0])),
+        _ => Err(anyhow::anyhow!(
+            "Not a valid RESP type: {:?}, starting with prefix: '{}' [byte: {}]",
+            buffer,
+            buffer[0] as char,
+            buffer[0]
+        )),
     }
 }
 
@@ -273,6 +364,13 @@ fn read_until_crlf(buffer: &[u8]) -> Option<(&[u8], usize)> {
     return None;
 }
 
+// Mostly useful in the main (server-side) command handling routine when the MULTI's queue should be flushed
+// rather than getting new commands from the TCP pipe on a call to EXEC.
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+pub enum RedisCommand {
+    EXEC, // On EXEC call
+}
+
 /// RedisValue represents any object passing through a Redis client or server, may it be an integer, a bulk string or
 /// any other main Redis, part of the RESP documentation which can be found [here](https://redis.io/docs/latest/develop/reference/protocol-spec/).
 #[derive(PartialEq, Clone, Debug, Hash, Eq)]
@@ -287,10 +385,14 @@ pub enum RedisValue {
     // NullArray,
     NullBulkString,
     ErrorMsg(Vec<u8>),
+
+    // Server private
+    Command(RedisCommand),
 }
 
-impl RedisValue {
-    pub fn serialize(self) -> String {
+// Only RedisValue and Vec<RedisValue> really need to be serialized
+impl RediSer for RedisValue {
+    fn serialize(&self) -> String {
         match self {
             RedisValue::SimpleString(s) => format!("+{}\r\n", s),
             RedisValue::BulkString(s) => format!("${}\r\n{}\r\n", s.chars().count(), s),
@@ -306,10 +408,25 @@ impl RedisValue {
                         .collect::<String>()
                 )
             }
-            RedisValue::ErrorMsg(v) => format!("-{}\r\n{}\r\n", v.len(), String::from_utf8(v).unwrap()), // v is correctly created at source => safer implementation could be wanted though
+            RedisValue::ErrorMsg(v) => {
+                format!("-{}\r\n{}\r\n", v.len(), String::from_utf8(v.clone()).unwrap())
+            } // `v`` is expected to be correctly created at source => safer implementation could be wanted though
+
+            _ => unimplemented!(), // Server internal commands should not leak to clients (what's the point?)
         }
     }
+}
 
+impl RediSer for Vec<RedisValue> {
+    fn serialize(&self) -> String {
+        let mut res = String::new();
+        for i in self {
+            res.push_str(&i.serialize());
+        }
+        res
+    }
+}
+impl RedisValue {
     pub fn keyize(&self) -> String {
         self.unpack_for_str().to_string()
     }

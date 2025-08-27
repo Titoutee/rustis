@@ -24,7 +24,7 @@ async fn main() {
                 tokio::spawn(async move { handle_connection(stream, id, cloned_db, cloned_id).await });
             }
             Err(e) => {
-                println!("Stream error: {}", e);
+                println!("Stream setup error: {}", e);
             }
         }
     }

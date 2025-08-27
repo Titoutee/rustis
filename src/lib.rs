@@ -2,10 +2,10 @@ mod ext;
 mod resp;
 
 use anyhow::Result;
-use core::{option::Option::None, time::Duration};
-pub use ext::{Notify, RedisValueInner, StackCtr};
+use core::option::Option::None;
+pub use ext::{Notify, RedisValueInner, StackCtr, RediSer};
 pub use resp::{Database, RedisArray, RedisInt, RedisValue, RespHandler, ThreadSafeDb};
-use std::collections::VecDeque;
+use std::{collections::VecDeque, fmt::Debug};
 pub use std::{
     clone,
     collections::HashMap,
@@ -13,7 +13,11 @@ pub use std::{
 };
 pub use tokio::net::{TcpListener, TcpStream};
 
-pub fn notify(notification: Notify, content: &str) {
+pub const OK: &'static str = "OK";
+pub const EMPTY_ARR: &'static str = "0";
+pub const QUEUED: &'static str = "QUEUED";
+
+pub fn notify<T: Debug>(notification: Notify, content: &T) {
     let prefix = String::from(match notification {
         Notify::Info => "(Info)",
         Notify::Recv => "(Recv)",
@@ -22,12 +26,13 @@ pub fn notify(notification: Notify, content: &str) {
         Notify::SendRaw => "(SendRaw)",
     });
 
-    println!("{}   >>>>>   {}", prefix, content);
+    println!("{}   >>>>>   {:?}", prefix, content);
 }
 
 #[derive(Debug)]
 struct Transaction {
     in_transaction: bool,
+    in_exec: bool,
     queue: VecDeque<Option<RedisValue>>,
 }
 
@@ -35,6 +40,7 @@ impl Transaction {
     fn init() -> Self {
         Transaction {
             in_transaction: false,
+            in_exec: false,
             queue: VecDeque::new(),
         }
     }
@@ -46,7 +52,28 @@ impl Transaction {
     fn pop(&mut self) -> Option<Option<RedisValue>> {
         self.queue.pop_back()
     }
+
+    fn switch_trans(&mut self) {
+        self.in_exec = false; // If for whatever reason it was on
+        self.in_transaction = true;
+    }
+
+    // After multi
+    fn switch_exec(&mut self) {
+        self.in_transaction = false;
+        self.in_exec = true;
+    }
+
+    // After exec
+    fn switch_neutral(&mut self) {
+        self.in_exec = false;
+        self.in_transaction = false; // If for whatever reason it was on
+    }
 }
+
+// Anything concerning response sending will not be seriously tested, as I know no way to early catch the responses before
+// flushing them and still send them through this procedure.
+// In the future, the response-crafting
 
 pub async fn handle_connection(
     stream: TcpStream,
@@ -58,118 +85,50 @@ pub async fn handle_connection(
     let mut handler = RespHandler::new(stream, id, map);
     let mut transaction = Transaction::init();
 
-    let ok = "+OK\r\n";
-    let empty_arr = "*0\r\n";
-
     loop {
         let val = handler.read_value().await.unwrap_or_else(|e| {
             eprintln!("Error reading value: {}", e);
             return None; // Gracefully return None to break out of the loop
         });
 
-        if transaction.in_transaction {
-            transaction.push(val);
-        } else {
-            let response = if let Some(v) = val {
-                notify(Notify::Recv, &v.clone().serialize());
+        println!("-------------");
+
+        let response = if let Some(v) = val.clone() {
+            notify(Notify::Recv, &v.clone().serialize());
+            if transaction.in_transaction {
+                transaction.push(val);
+                RedisValue::SimpleString(QUEUED.to_string())
+            } else {
                 let (command, args) = extract_cmd(v).unwrap();
                 match command.to_ascii_lowercase().as_str() {
                     "multi" => {
-                        transaction.in_transaction = true;
-                        RedisValue::SimpleString(ok.to_string())
+                        handler.handle_multi(&mut transaction).await
                     }
                     "exec" => {
-                        if !transaction.in_transaction {
-                            RedisValue::ErrorMsg(Vec::from("Exec called with empty queue..."));
-                        } else if transaction.queue.is_empty() {
-                            transaction.in_transaction = false;
-                            RedisValue::ErrorMsg(Vec::from(empty_arr));
-                        }
-                        RedisValue::NullBulkString
+                        handler.handle_exec(&mut transaction).await
                     }
 
-                    any => match any {
-                        "ping" => RedisValue::SimpleString("PONG".to_string()),
-                        "echo" => args.first().unwrap().clone(),
-                        "set" => {
-                            println!("{:?}", args);
-                            let mut args_iter = args.iter();
-                            let (key, value, sub1, sub2) = (
-                                args_iter.next(),
-                                args_iter.next(),
-                                args_iter.next(),
-                                args_iter.next(),
-                            );
-
-                            let exp = if let Some(cmd) = sub1 {
-                                match cmd
-                                    .unpack_str_variant()
-                                    .unwrap()
-                                    .to_ascii_lowercase()
-                                    .as_str()
-                                {
-                                    "px" => {
-                                        if let Some(d) = sub2 {
-                                            let milli = d
-                                                .unpack_str_variant()
-                                                .unwrap()
-                                                .parse::<u64>()
-                                                .unwrap();
-                                            Some(Duration::from_millis(milli))
-                                        } else {
-                                            None
-                                        }
-                                    }
-
-                                    _ => None,
-                                }
-                            } else {
-                                None
-                            };
-                            handler
-                                .insert(key.unwrap(), value.unwrap().clone(), exp)
-                                .await;
-                            RedisValue::SimpleString("Ok".to_string())
-                        }
-                        "get" => {
-                            if let Some(a) = handler.get_val(args.first().unwrap()).await {
-                                a
-                            } else {
-                                RedisValue::NullBulkString
-                            }
-                        }
-                        "incr" => {
-                            let key = &args.iter().next().unwrap().clone();
-                            let val = handler.get_val(&key).await;
-
-                            let response = match val {
-                                Some(RedisValue::Int(_)) | None => {
-                                    if let Some(n) = handler.incr(key).await {
-                                        n
-                                    } else {
-                                        RedisValue::NullBulkString
-                                    }
-                                }
-                                _ => RedisValue::ErrorMsg(Vec::from(
-                                    "(error) value is not an integer or out of range",
-                                )),
-                            };
-                            response
-                        }
-
-                        c => panic!("Erroneous command to handle: {}", c),
-                    },
+                    any => handler.handle_command(any, args).await,
                 }
-            } else {
-                break;
-            };
-
-            notify(Notify::Send, &response.clone().serialize());
-
-            if let Err(e) = handler.write_value(response).await {
-                eprintln!("Error writing value to to-client handler's buffer: {}", e);
-                break; // Stop processing if writing fails
             }
+        } else {
+            break;
+        };
+
+        let to_send = 
+        if let RedisValue::Command(c) = &response {
+            notify(Notify::Send, &transaction.queue);
+            transaction.switch_neutral();
+            transaction.queue.clone().into_iter().map(|o| o.unwrap()).collect::<Vec<RedisValue>>()
+        } else {
+            notify(Notify::Send, &response.clone().serialize());
+            vec![response]
+        };
+        
+
+        if let Err(e) = handler.write_value(to_send).await {
+            eprintln!("Error writing value to to-client handler's buffer: {}", e);
+            break; // Stop processing if writing fails
         }
     }
     handler.cleanup();
